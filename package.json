@@ -1,13 +1,14 @@
 {
   "name": "nx-usdt-backend",
   "version": "1.0.0",
-  "private": true,
+  "description": "NX USDT Telegram Mini App Backend",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",
