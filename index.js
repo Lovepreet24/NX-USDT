@@ -491,4 +491,27 @@ app.post('/payout', authTelegram, async (req, res) => {
       message: 'Withdrawal request saved. No USDT has been transferred.'
     });
   } catch (error) {
-   
+    console.error('/payout:', error.message);
+    return fail(res, 400, 'Could not create withdrawal request. Check Supabase RPC and eligibility.');
+  }
+});
+
+app.post('/admin/payout/process', authAdmin, async (req, res) => {
+  return fail(
+    res,
+    503,
+    'Live transfer worker is disabled. No USDT transfer was made.'
+  );
+});
+
+app.use((req, res) => fail(res, 404, 'API endpoint not found.'));
+
+app.use((error, req, res, next) => {
+  console.error('Unhandled API error:', error.message);
+  if (res.headersSent) return next(error);
+  return fail(res, 500, 'Internal server error.');
+});
+
+app.listen(PORT, () => {
+  console.log(`NX USDT API listening on port ${PORT}`);
+});
