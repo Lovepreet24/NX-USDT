@@ -1,7 +1,7 @@
 {
   "name": "nx-usdt-backend",
   "version": "1.0.0",
-  "description": "NX USDT Mini App Backend",
+  "private": true,
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -12,6 +12,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",
     "cors": "^2.8.5",
+    "ethers": "^6.15.0",
     "express": "^5.1.0"
   }
 }
