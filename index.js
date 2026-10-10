@@ -57,6 +57,27 @@ const AD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const REQUIRE_AD_CLICK = process.env.REQUIRE_AD_CLICK !== 'false';
 
+/* ---- Auto payout (BEP-20 USDT) ---- */
+const AUTO_PAYOUT_ENABLED = process.env.AUTO_PAYOUT_ENABLED === 'true';
+const AUTO_PAYOUT_MAX_USDT = Number(process.env.AUTO_PAYOUT_MAX_USDT || 20);
+const BSC_RPC_URL = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org/';
+const PAYOUT_PRIVATE_KEY = process.env.PAYOUT_PRIVATE_KEY || '';
+const USDT_CONTRACT =
+  process.env.USDT_CONTRACT || '0x55d398326f99059fF775485246999027B3197955'; // BSC USDT
+const USDT_DECIMALS = Number(process.env.USDT_DECIMALS || 18);
+
+/* ---- Tasks ---- */
+const AUTO_VERIFY_TASKS = process.env.AUTO_VERIFY_TASKS !== 'false';
+const TASKS = {
+  telegram_earn:   { type: 'telegram', chat: process.env.CHANNEL_EARN || '@NXUSDTEarn' },
+  telegram_payout: { type: 'telegram', chat: process.env.CHANNEL_PAYOUT || '@NXUSDTPayout' },
+  youtube_1: { type: 'youtube' },
+  youtube_2: { type: 'youtube' },
+  youtube_3: { type: 'youtube' },
+  youtube_4: { type: 'youtube' }
+};
+const TASK_KEYS = Object.keys(TASKS);
+
 const ALLOWED_ORIGINS = (
   process.env.ALLOWED_ORIGINS ||
   'https://nxcoinwebbot.vercel.app'
@@ -452,7 +473,82 @@ async function getAccount(tg) {
     }
   };
 }
+/* ---------- Telegram channel membership check ---------- */
+async function isChannelMember(chatId, userId) {
+  const url =
+    `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember` +
+    `?chat_id=${encodeURIComponent(chatId)}&user_id=${encodeURIComponent(userId)}`;
 
+  const response = await fetch(url);
+  const json = await response.json();
+
+  if (!json.ok) {
+    console.error('getChatMember failed:', json.description);
+    throw new Error('Could not verify channel membership.');
+  }
+
+  return ['creator', 'administrator', 'member'].includes(json.result.status);
+}
+
+/* ---------- Auto payout ---------- */
+let usdtContract = null;
+
+function getUsdtContract() {
+  if (usdtContract) return usdtContract;
+  if (!PAYOUT_PRIVATE_KEY) throw new Error('PAYOUT_PRIVATE_KEY is not set.');
+
+  const provider = new ethers.JsonRpcProvider(BSC_RPC_URL);
+  const wallet = new ethers.Wallet(PAYOUT_PRIVATE_KEY, provider);
+
+  usdtContract = new ethers.Contract(
+    USDT_CONTRACT,
+    ['function transfer(address to, uint256 amount) returns (bool)'],
+    wallet
+  );
+
+  return usdtContract;
+}
+
+async function sendPayout(payout) {
+  /* Lock the row so the same payout can never be sent twice. */
+  const { data: locked, error: lockError } = await db
+    .from('trial_payouts')
+    .update({ status: 'processing' })
+    .eq('id', payout.id)
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle();
+
+  if (lockError) throw lockError;
+  if (!locked) return { success: false, error: 'Payout is already being processed.' };
+
+  try {
+    const amount = ethers.parseUnits(
+      Number(payout.amount_usdt).toFixed(2),
+      USDT_DECIMALS
+    );
+
+    const tx = await getUsdtContract().transfer(payout.wallet_address, amount);
+
+    await db.from('trial_payouts').update({ tx_hash: tx.hash }).eq('id', payout.id);
+    await tx.wait(1);
+
+    await db
+      .from('trial_payouts')
+      .update({
+        status: 'paid',
+        tx_hash: tx.hash,
+        processed_at: new Date().toISOString()
+      })
+      .eq('id', payout.id);
+
+    return { success: true, txHash: tx.hash };
+  } catch (error) {
+    console.error('sendPayout failed:', error.message);
+    await db.from('trial_payouts').update({ status: 'failed' }).eq('id', payout.id);
+    return { success: false, error: 'Transfer failed. Admin will review.' };
+  }
+}
 app.get('/', (req, res) => {
   res.json({
     success: true,
@@ -595,45 +691,30 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
   }
 });
 
-/*
- * Client-side claim endpoint.
- * The SQL function must verify that a pending attempt exists,
- * and must reject duplicate claims for the same ad slot.
- */
 app.post('/adsgram/claim', authTelegram, async (req, res) => {
   try {
     const adId = Number(req.body?.adId);
 
-    if (
-      !Number.isInteger(adId) ||
-      adId < 1 ||
-      adId > ADS_PER_24H
-    ) {
+    if (!Number.isInteger(adId) || adId < 1 || adId > ADS_PER_24H) {
       return fail(res, 400, 'Invalid ad slot.');
     }
 
-    /*
-     * Do not claim an ad if that slot already has a verified
-     * reward in its current 24-hour window.
-     */
-    const cooldowns = await getAdCooldowns(
-      req.telegramUser.id
-    );
+    if (REQUIRE_AD_CLICK && req.body?.clicked !== true) {
+      return fail(res, 400, 'You must click the ad button to earn the reward.', {
+        clickRequired: true
+      });
+    }
 
+    const cooldowns = await getAdCooldowns(req.telegramUser.id);
     const slot = cooldowns.find(item => item.adId === adId);
 
     if (slot?.locked) {
-      return fail(
-        res,
-        409,
-        'This ad slot has already been rewarded in the last 24 hours.',
-        {
-          adId,
-          locked: true,
-          availableAgainAt: slot.availableAgainAt,
-          remainingSeconds: slot.remainingSeconds
-        }
-      );
+      return fail(res, 409, 'This ad slot has already been rewarded in the last 24 hours.', {
+        adId,
+        locked: true,
+        availableAgainAt: slot.availableAgainAt,
+        remainingSeconds: slot.remainingSeconds
+      });
     }
 
     const result = await rpc('trial_confirm_ad_reward', {
@@ -642,17 +723,11 @@ app.post('/adsgram/claim', authTelegram, async (req, res) => {
     });
 
     if (result?.success !== true) {
-      return fail(
-        res,
-        409,
-        result?.reason || 'No valid pending ad attempt.'
-      );
+      return fail(res, 409, result?.reason || 'No valid pending ad attempt.');
     }
 
     const account = await getAccount(req.telegramUser);
-    const updatedSlot = account.adCooldowns.find(
-      item => item.adId === adId
-    );
+    const updatedSlot = account.adCooldowns.find(item => item.adId === adId);
 
     return res.json({
       success: true,
@@ -673,6 +748,9 @@ app.post('/adsgram/claim', authTelegram, async (req, res) => {
 /* AdsGram server-to-server Reward URL callback. */
 app.get('/adsgram/reward', async (req, res) => {
   try {
+    if (REQUIRE_AD_CLICK) {
+      return res.status(200).send('Ignored: click-required mode.');
+    }
     if (!ADSGRAM_REWARD_SECRET) {
       return res.status(503).send(
         'Reward callback is not configured.'
@@ -758,16 +836,37 @@ app.post('/adsgram/status', authTelegram, async (req, res) => {
 app.post('/tasks/submit', authTelegram, async (req, res) => {
   try {
     const taskKey = String(req.body?.taskKey || '');
+    const task = TASKS[taskKey];
 
-    if (![
-      'telegram_earn',
-      'telegram_payout'
-    ].includes(taskKey)) {
-      return fail(res, 400, 'This task is not available yet.');
+    if (!task) return fail(res, 400, 'This task is not available.');
+
+    const userId = req.telegramUser.id;
+
+    if (task.type === 'telegram' && AUTO_VERIFY_TASKS) {
+      const member = await isChannelMember(task.chat, userId);
+
+      if (!member) {
+        return fail(res, 400, 'Join the channel first, then press submit again.');
+      }
+
+      await rpc('trial_submit_task', { p_telegram_id: userId, p_task_key: taskKey });
+
+      const review = await rpc('trial_review_task', {
+        p_telegram_id: userId,
+        p_task_key: taskKey,
+        p_decision: 'approve',
+        p_reward: TASK_REWARD
+      });
+
+      return res.json({
+        success: true,
+        result: review,
+        message: 'Channel verified. Reward added!'
+      });
     }
 
     const result = await rpc('trial_submit_task', {
-      p_telegram_id: req.telegramUser.id,
+      p_telegram_id: userId,
       p_task_key: taskKey
     });
 
@@ -778,7 +877,9 @@ app.post('/tasks/submit', authTelegram, async (req, res) => {
     });
   } catch (error) {
     console.error('/tasks/submit:', error.message);
-    return fail(res, 400, 'Could not submit task.');
+    return fail(res, 400, error.message === 'Could not verify channel membership.'
+      ? error.message
+      : 'Could not submit task.');
   }
 });
 
@@ -790,7 +891,7 @@ app.post('/admin/task/review', authAdmin, async (req, res) => {
 
     if (
       !/^\d{1,20}$/.test(telegramId) ||
-      !['telegram_earn', 'telegram_payout'].includes(taskKey) ||
+      !TASK_KEYS.includes(taskKey) ||
       !['approve', 'reject'].includes(decision)
     ) {
       return fail(res, 400, 'Invalid review data.');
@@ -824,9 +925,40 @@ app.post('/payouts', authTelegram, async (req, res) => {
 
     if (error) throw error;
 
+        let message = 'Withdrawal request saved. It will be reviewed shortly.';
+    let status = 'pending';
+    let txHash = null;
+
+    if (AUTO_PAYOUT_ENABLED && amount <= AUTO_PAYOUT_MAX_USDT) {
+      const { data: row } = await db
+        .from('trial_payouts')
+        .select('*')
+        .eq('telegram_id', req.telegramUser.id)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (row) {
+        const sent = await sendPayout(row);
+
+        if (sent.success) {
+          status = 'paid';
+          txHash = sent.txHash;
+          message = 'Withdrawal sent to your wallet!';
+        } else {
+          message = 'Withdrawal saved. Automatic transfer failed, admin will process it.';
+        }
+      }
+    }
+
     return res.json({
       success: true,
-      payouts: data || []
+      result,
+      status,
+      txHash,
+      automaticPayoutEnabled: AUTO_PAYOUT_ENABLED,
+      message
     });
   } catch (error) {
     console.error('/payouts:', error.message);
@@ -922,13 +1054,22 @@ app.post('/payout', authTelegram, async (req, res) => {
 });
 
 app.post('/admin/payout/process', authAdmin, async (req, res) => {
-  return fail(
-    res,
-    503,
-    'Live transfer worker is disabled. No USDT transfer was made.'
-  );
-});
+  try {
+    const payoutId = req.body?.payoutId;
+    if (!payoutId) return fail(res, 400, 'payoutId is required.');
 
+    const { data: row, error } = await db
+      .from('trial_payouts').select('*').eq('id', payoutId).maybeSingle();
+
+    if (error || !row) return fail(res, 404, 'Payout not found.');
+
+    const sent = await sendPayout(row);
+    return sent.success ? res.json(sent) : fail(res, 400, sent.error);
+  } catch (error) {
+    console.error('/admin/payout/process:', error.message);
+    return fail(res, 500, 'Could not process payout.');
+  }
+});
 app.use((req, res) => {
   return fail(res, 404, 'API endpoint not found.');
 });
