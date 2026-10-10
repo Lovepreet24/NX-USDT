@@ -183,7 +183,7 @@ function verifyTelegramInitData(raw) {
   if (
     !Number.isFinite(authDate) ||
     authDate > now + 60 ||
-    now - authDate > 3600
+    now - authDate > 86400
   ) {
     throw new Error(
       'Telegram session expired. Reopen the Mini App.'
@@ -510,17 +510,18 @@ function getUsdtContract() {
 }
 
 async function sendPayout(payout) {
-  /* Lock the row so the same payout can never be sent twice. */
   const { data: locked, error: lockError } = await db
     .from('trial_payouts')
     .update({ status: 'processing' })
     .eq('id', payout.id)
-    .eq('status', 'pending')
+    .in('status', ['pending', 'failed'])
     .select('id')
     .maybeSingle();
 
   if (lockError) throw lockError;
-  if (!locked) return { success: false, error: 'Payout is already being processed.' };
+  if (!locked) return { success: false, error: 'Payout is already being processed or paid.' };
+
+  let txHash = null;
 
   try {
     const amount = ethers.parseUnits(
@@ -529,23 +530,31 @@ async function sendPayout(payout) {
     );
 
     const tx = await getUsdtContract().transfer(payout.wallet_address, amount);
+    txHash = tx.hash;
 
-    await db.from('trial_payouts').update({ tx_hash: tx.hash }).eq('id', payout.id);
+    await db.from('trial_payouts').update({ tx_hash: txHash }).eq('id', payout.id);
     await tx.wait(1);
 
     await db
       .from('trial_payouts')
       .update({
         status: 'paid',
-        tx_hash: tx.hash,
+        tx_hash: txHash,
         processed_at: new Date().toISOString()
       })
       .eq('id', payout.id);
 
-    return { success: true, txHash: tx.hash };
+    return { success: true, txHash };
   } catch (error) {
     console.error('sendPayout failed:', error.message);
-    await db.from('trial_payouts').update({ status: 'failed' }).eq('id', payout.id);
+
+    if (!txHash) {
+      await db.from('trial_payouts').update({ status: 'failed' }).eq('id', payout.id);
+    } else {
+      /* Tx was broadcast: leave as 'processing' and check BscScan manually. */
+      console.error('Transaction was sent, verify manually:', txHash);
+    }
+
     return { success: false, error: 'Transfer failed. Admin will review.' };
   }
 }
@@ -925,40 +934,9 @@ app.post('/payouts', authTelegram, async (req, res) => {
 
     if (error) throw error;
 
-        let message = 'Withdrawal request saved. It will be reviewed shortly.';
-    let status = 'pending';
-    let txHash = null;
-
-    if (AUTO_PAYOUT_ENABLED && amount <= AUTO_PAYOUT_MAX_USDT) {
-      const { data: row } = await db
-        .from('trial_payouts')
-        .select('*')
-        .eq('telegram_id', req.telegramUser.id)
-        .eq('status', 'pending')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (row) {
-        const sent = await sendPayout(row);
-
-        if (sent.success) {
-          status = 'paid';
-          txHash = sent.txHash;
-          message = 'Withdrawal sent to your wallet!';
-        } else {
-          message = 'Withdrawal saved. Automatic transfer failed, admin will process it.';
-        }
-      }
-    }
-
     return res.json({
       success: true,
-      result,
-      status,
-      txHash,
-      automaticPayoutEnabled: AUTO_PAYOUT_ENABLED,
-      message
+      payouts: data || []
     });
   } catch (error) {
     console.error('/payouts:', error.message);
@@ -1034,13 +1012,40 @@ app.post('/payout', authTelegram, async (req, res) => {
       );
     }
 
+       let message = 'Withdrawal request saved. It will be reviewed shortly.';
+    let status = 'pending';
+    let txHash = null;
+
+    if (AUTO_PAYOUT_ENABLED && amount <= AUTO_PAYOUT_MAX_USDT) {
+      const { data: row } = await db
+        .from('trial_payouts')
+        .select('*')
+        .eq('telegram_id', req.telegramUser.id)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (row) {
+        const sent = await sendPayout(row);
+
+        if (sent.success) {
+          status = 'paid';
+          txHash = sent.txHash;
+          message = 'Withdrawal sent to your wallet!';
+        } else {
+          message = 'Withdrawal saved. Automatic transfer failed, admin will process it.';
+        }
+      }
+    }
+
     return res.json({
       success: true,
       result,
-      status: 'pending',
-      automaticPayoutEnabled: false,
-      message:
-        'Withdrawal request saved. No USDT has been transferred.'
+      status,
+      txHash,
+      automaticPayoutEnabled: AUTO_PAYOUT_ENABLED,
+      message
     });
   } catch (error) {
     console.error('/payout:', error.message);
