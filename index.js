@@ -307,4 +307,477 @@ async function getAccount(tg) {
 
     db.from('trial_task_claims')
       .select('task_key,status')
-      .eq('
+      .eq('telegram_id', tg.id)
+  ]);
+
+  for (const result of [
+    ads,
+    approvedTasks,
+    referrals,
+    payouts,
+    taskRows
+  ]) {
+    if (result.error) throw result.error;
+  }
+
+  const taskStatus = {};
+
+  for (const row of taskRows.data || []) {
+    taskStatus[row.task_key] = row.status;
+  }
+
+  const balance = Number(user.balance_usdt || 0);
+  const adsWatched = ads.count || 0;
+  const tasksCompleted = approvedTasks.count || 0;
+
+  return {
+    user: {
+      id: user.telegram_id,
+      first_name: user.first_name,
+      username: user.username
+    },
+
+    balance,
+    referrals: referrals.count || 0,
+    referralReward: REFERRAL_REWARD,
+
+    referralLink:
+      `https://t.me/${BOT_USERNAME}/Web?startapp=ref_${tg.id}`,
+
+    referralHistory: [],
+    adsWatched,
+    requiredAds: REQUIRED_ADS,
+    tasksCompleted,
+    requiredTasks: REQUIRED_TASKS,
+    taskStatus,
+    payouts: payouts.data || [],
+
+    canWithdraw:
+      adsWatched >= REQUIRED_ADS &&
+      tasksCompleted >= REQUIRED_TASKS &&
+      balance >= MIN_WITHDRAWAL,
+
+    config: {
+      appName: 'NX USDT',
+      joiningBonusUSDT: JOINING_BONUS,
+      referralRewardUSDT: REFERRAL_REWARD,
+      taskRewardUSDT: TASK_REWARD,
+      adRewardUSDT: AD_REWARD,
+      minWithdrawalUSDT: MIN_WITHDRAWAL,
+      maxWithdrawalUSDT: MAX_WITHDRAWAL,
+      adsPer24Hours: ADS_PER_24H,
+      requiredAds: REQUIRED_ADS,
+      requiredTasks: REQUIRED_TASKS,
+      adsgramBlockId: ADSGRAM_BLOCK_ID,
+      youtubeTasksComingSoon: 4
+    }
+  };
+}
+
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    app: 'NX USDT',
+    status: 'online'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    success: true,
+    status: 'ok'
+  });
+});
+
+app.post('/sync', authTelegram, async (req, res) => {
+  try {
+    const tg = req.telegramUser;
+
+    const startParam = String(
+      req.body?.startParam || tg.start_param || ''
+    );
+
+    let referrerId = /^ref_\d{1,20}$/.test(startParam)
+      ? startParam.slice(4)
+      : null;
+
+    if (referrerId === tg.id) {
+      referrerId = null;
+    }
+
+    await rpc('trial_sync_user', {
+      p_telegram_id: tg.id,
+      p_first_name: tg.first_name,
+      p_username: tg.username || null,
+      p_photo_url: tg.photo_url || null,
+      p_referrer_id: referrerId,
+      p_joining_bonus: JOINING_BONUS,
+      p_referral_reward: REFERRAL_REWARD
+    });
+
+    return res.json({
+      success: true,
+      ...(await getAccount(tg))
+    });
+  } catch (error) {
+    console.error('/sync:', error.message);
+
+    return fail(
+      res,
+      500,
+      'Could not initialize account. Check Supabase RPC/table setup.'
+    );
+  }
+});
+
+app.post('/account', authTelegram, async (req, res) => {
+  try {
+    return res.json({
+      success: true,
+      ...(await getAccount(req.telegramUser))
+    });
+  } catch (error) {
+    console.error('/account:', error.message);
+    return fail(res, 500, 'Could not load account.');
+  }
+});
+
+app.post('/adsgram/start', authTelegram, async (req, res) => {
+  try {
+    const adId = Number(req.body?.adId);
+
+    if (
+      !Number.isInteger(adId) ||
+      adId < 1 ||
+      adId > ADS_PER_24H
+    ) {
+      return fail(res, 400, 'Invalid ad slot.');
+    }
+
+    const result = await rpc('trial_start_ad_attempt', {
+      p_telegram_id: req.telegramUser.id,
+      p_ad_id: adId,
+      p_reward_usdt: AD_REWARD,
+      p_max_ads_24h: ADS_PER_24H
+    });
+
+    if (result?.success === false) {
+      return fail(
+        res,
+        409,
+        result.error || result.reason || 'Ad attempt denied.'
+      );
+    }
+
+    return res.json({
+      success: true,
+      result
+    });
+  } catch (error) {
+    console.error('/adsgram/start:', error.message);
+
+    return fail(
+      res,
+      400,
+      'Could not start ad. Check the daily limit and RPC setup.'
+    );
+  }
+});
+
+/*
+ * AdsGram Reward URL:
+ * https://nx-usdt-production.up.railway.app/adsgram/reward
+ *   ?secret=YOUR_SECRET&userid=[userId]
+ *
+ * This callback must not credit rewards unless the matching
+ * Supabase RPC verifies and atomically consumes a pending attempt.
+ */
+app.get('/adsgram/reward', async (req, res) => {
+  try {
+    if (!ADSGRAM_REWARD_SECRET) {
+      return res.status(503).send(
+        'Reward callback is not configured.'
+      );
+    }
+
+    if (!safeEqual(
+      req.query.secret,
+      ADSGRAM_REWARD_SECRET
+    )) {
+      return res.status(401).send('Unauthorized.');
+    }
+
+    const userId = String(
+      req.query.userid || req.query.userId || ''
+    );
+
+    if (!/^\d{1,20}$/.test(userId)) {
+      return res.status(400).send('Invalid user ID.');
+    }
+
+    /*
+     * The current trial_confirm_ad_reward SQL function is a
+     * deliberate no-credit placeholder. Do not treat its result
+     * as a successful reward until it is replaced with an atomic
+     * pending-attempt verification function.
+     */
+    const result = await rpc('trial_confirm_ad_reward', {
+      p_telegram_id: userId,
+      p_reward_usdt: AD_REWARD
+    });
+
+    if (
+      result?.success === false ||
+      result?.credited !== true
+    ) {
+      return res.status(409).send(
+        'Reward not credited: verified pending attempt required.'
+      );
+    }
+
+    return res.status(200).send('OK');
+  } catch (error) {
+    console.error('/adsgram/reward:', error.message);
+
+    return res.status(500).send(
+      'Reward processing failed.'
+    );
+  }
+});
+
+app.post('/adsgram/status', authTelegram, async (req, res) => {
+  try {
+    const adId = Number(req.body?.adId);
+
+    if (
+      !Number.isInteger(adId) ||
+      adId < 1 ||
+      adId > ADS_PER_24H
+    ) {
+      return fail(res, 400, 'Invalid ad slot.');
+    }
+
+    const { data, error } = await db
+      .from('trial_ad_claims')
+      .select('verification_status,created_at,reward_usdt')
+      .eq('telegram_id', req.telegramUser.id)
+      .eq('ad_id', adId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return fail(res, 404, 'No ad claim found.');
+    }
+
+    const account = await getAccount(req.telegramUser);
+
+    return res.json({
+      success: true,
+      verified: data.verification_status === 'verified',
+      reward:
+        data.verification_status === 'verified'
+          ? Number(data.reward_usdt || AD_REWARD)
+          : 0,
+      balance: account.balance,
+      verificationStatus: data.verification_status
+    });
+  } catch (error) {
+    console.error('/adsgram/status:', error.message);
+    return fail(res, 500, 'Could not check ad status.');
+  }
+});
+
+app.post('/tasks/submit', authTelegram, async (req, res) => {
+  try {
+    const taskKey = String(req.body?.taskKey || '');
+
+    if (![
+      'telegram_earn',
+      'telegram_payout'
+    ].includes(taskKey)) {
+      return fail(res, 400, 'This task is not available yet.');
+    }
+
+    const result = await rpc('trial_submit_task', {
+      p_telegram_id: req.telegramUser.id,
+      p_task_key: taskKey
+    });
+
+    return res.json({
+      success: true,
+      result,
+      message: 'Submitted for admin verification.'
+    });
+  } catch (error) {
+    console.error('/tasks/submit:', error.message);
+    return fail(res, 400, 'Could not submit task.');
+  }
+});
+
+app.post('/admin/task/review', authAdmin, async (req, res) => {
+  try {
+    const telegramId = String(req.body?.telegramId || '');
+    const taskKey = String(req.body?.taskKey || '');
+    const decision = String(req.body?.decision || '');
+
+    if (
+      !/^\d{1,20}$/.test(telegramId) ||
+      !['telegram_earn', 'telegram_payout'].includes(taskKey) ||
+      !['approve', 'reject'].includes(decision)
+    ) {
+      return fail(res, 400, 'Invalid review data.');
+    }
+
+    const result = await rpc('trial_review_task', {
+      p_telegram_id: telegramId,
+      p_task_key: taskKey,
+      p_decision: decision,
+      p_reward: TASK_REWARD
+    });
+
+    return res.json({
+      success: true,
+      result
+    });
+  } catch (error) {
+    console.error('/admin/task/review:', error.message);
+    return fail(res, 400, 'Could not review task.');
+  }
+});
+
+app.post('/payouts', authTelegram, async (req, res) => {
+  try {
+    const { data, error } = await db
+      .from('trial_payouts')
+      .select('*')
+      .eq('telegram_id', req.telegramUser.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+
+    return res.json({
+      success: true,
+      payouts: data || []
+    });
+  } catch (error) {
+    console.error('/payouts:', error.message);
+    return fail(res, 500, 'Could not load payout history.');
+  }
+});
+
+app.post('/payout', authTelegram, async (req, res) => {
+  try {
+    const amount = Number(req.body?.amount);
+
+    const walletAddress = String(
+      req.body?.walletAddress ||
+      req.body?.wallet ||
+      ''
+    ).trim();
+
+    const maximum = Math.min(
+      MAX_WITHDRAWAL,
+      Number(process.env.PAYOUT_MAX_USDT || 100)
+    );
+
+    if (
+      !Number.isFinite(amount) ||
+      amount < MIN_WITHDRAWAL ||
+      amount > maximum
+    ) {
+      return fail(
+        res,
+        400,
+        `Withdrawal amount must be between ${MIN_WITHDRAWAL} and ${maximum} USDT.`
+      );
+    }
+
+    if (!ethers.isAddress(walletAddress)) {
+      return fail(res, 400, 'Enter a valid BEP-20 wallet address.');
+    }
+
+    const account = await getAccount(req.telegramUser);
+
+    if (!account.canWithdraw) {
+      return fail(
+        res,
+        403,
+        'Withdrawal requirements are not complete.',
+        {
+          requiredAds: REQUIRED_ADS,
+          adsWatched: account.adsWatched,
+          requiredTasks: REQUIRED_TASKS,
+          tasksCompleted: account.tasksCompleted,
+          minimum: MIN_WITHDRAWAL,
+          balance: account.balance
+        }
+      );
+    }
+
+    /*
+     * The SQL function currently accepts exactly these
+     * three parameters. Do not pass the old extra arguments.
+     */
+    const result = await rpc('trial_request_payout', {
+      p_telegram_id: req.telegramUser.id,
+      p_amount_usdt: amount,
+      p_wallet_address: walletAddress
+    });
+
+    if (result?.success === false) {
+      return fail(
+        res,
+        400,
+        result.error || 'Withdrawal request rejected.',
+        { result }
+      );
+    }
+
+    return res.json({
+      success: true,
+      result,
+      status: 'pending',
+      automaticPayoutEnabled: false,
+      message:
+        'Withdrawal request saved. No USDT has been transferred.'
+    });
+  } catch (error) {
+    console.error('/payout:', error.message);
+
+    return fail(
+      res,
+      400,
+      'Could not create withdrawal request. Check eligibility and Supabase RPC.'
+    );
+  }
+});
+
+app.post('/admin/payout/process', authAdmin, async (req, res) => {
+  return fail(
+    res,
+    503,
+    'Live transfer worker is disabled. No USDT transfer was made.'
+  );
+});
+
+app.use((req, res) => {
+  return fail(res, 404, 'API endpoint not found.');
+});
+
+app.use((error, req, res, next) => {
+  console.error('Unhandled API error:', error.message);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return fail(res, 500, 'Internal server error.');
+});
+
+app.listen(PORT, () => {
+  console.log(`NX USDT API listening on port ${PORT}`);
+});
