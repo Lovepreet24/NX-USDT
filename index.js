@@ -51,7 +51,9 @@ const ADSGRAM_BLOCK_ID = String(
 );
 const ADSGRAM_REWARD_SECRET =
   process.env.ADSGRAM_REWARD_SECRET || '';
+
 const ADS_PER_24H = 12;
+const AD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 
 const ALLOWED_ORIGINS = (
@@ -258,6 +260,77 @@ async function rpc(name, args) {
   return data;
 }
 
+/*
+ * Returns the latest verified claim for every ad slot
+ * within the rolling 24-hour window.
+ */
+async function getAdCooldowns(telegramId) {
+  const since = new Date(
+    Date.now() - AD_COOLDOWN_MS
+  ).toISOString();
+
+  const { data, error } = await db
+    .from('trial_ad_claims')
+    .select('ad_id,created_at,reward_usdt,verification_status')
+    .eq('telegram_id', telegramId)
+    .eq('verification_status', 'verified')
+    .gte('created_at', since)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+
+  const latestByAd = {};
+  const now = Date.now();
+
+  for (const row of data || []) {
+    const adId = Number(row.ad_id);
+
+    if (
+      !Number.isInteger(adId) ||
+      adId < 1 ||
+      adId > ADS_PER_24H ||
+      latestByAd[adId]
+    ) {
+      continue;
+    }
+
+    const watchedAt = new Date(row.created_at).getTime();
+
+    if (!Number.isFinite(watchedAt)) continue;
+
+    const availableAt = watchedAt + AD_COOLDOWN_MS;
+    const remainingMs = Math.max(0, availableAt - now);
+
+    latestByAd[adId] = {
+      adId,
+      verified: true,
+      locked: remainingMs > 0,
+      lastWatchedAt: row.created_at,
+      availableAgainAt: new Date(availableAt).toISOString(),
+      remainingSeconds: Math.ceil(remainingMs / 1000),
+      reward: Number(row.reward_usdt || AD_REWARD)
+    };
+  }
+
+  const ads = [];
+
+  for (let adId = 1; adId <= ADS_PER_24H; adId++) {
+    ads.push(
+      latestByAd[adId] || {
+        adId,
+        verified: false,
+        locked: false,
+        lastWatchedAt: null,
+        availableAgainAt: null,
+        remainingSeconds: 0,
+        reward: 0
+      }
+    );
+  }
+
+  return ads;
+}
+
 async function getAccount(tg) {
   const { data: user, error: userError } = await db
     .from('trial_users')
@@ -274,7 +347,7 @@ async function getAccount(tg) {
   }
 
   const since = new Date(
-    Date.now() - 24 * 60 * 60 * 1000
+    Date.now() - AD_COOLDOWN_MS
   ).toISOString();
 
   const [
@@ -282,7 +355,8 @@ async function getAccount(tg) {
     approvedTasks,
     referrals,
     payouts,
-    taskRows
+    taskRows,
+    adCooldowns
   ] = await Promise.all([
     db.from('trial_ad_claims')
       .select('id', { count: 'exact', head: true })
@@ -307,7 +381,9 @@ async function getAccount(tg) {
 
     db.from('trial_task_claims')
       .select('task_key,status')
-      .eq('telegram_id', tg.id)
+      .eq('telegram_id', tg.id),
+
+    getAdCooldowns(tg.id)
   ]);
 
   for (const result of [
@@ -346,6 +422,7 @@ async function getAccount(tg) {
 
     referralHistory: [],
     adsWatched,
+    adCooldowns,
     requiredAds: REQUIRED_ADS,
     tasksCompleted,
     requiredTasks: REQUIRED_TASKS,
@@ -366,6 +443,7 @@ async function getAccount(tg) {
       minWithdrawalUSDT: MIN_WITHDRAWAL,
       maxWithdrawalUSDT: MAX_WITHDRAWAL,
       adsPer24Hours: ADS_PER_24H,
+      adCooldownHours: 24,
       requiredAds: REQUIRED_ADS,
       requiredTasks: REQUIRED_TASKS,
       adsgramBlockId: ADSGRAM_BLOCK_ID,
@@ -442,7 +520,10 @@ app.post('/account', authTelegram, async (req, res) => {
   }
 });
 
-/* Start an ad attempt. This does not credit any reward. */
+/*
+ * Start an ad attempt.
+ * The SQL function must enforce cooldown atomically.
+ */
 app.post('/adsgram/start', authTelegram, async (req, res) => {
   try {
     const adId = Number(req.body?.adId);
@@ -453,6 +534,32 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
       adId > ADS_PER_24H
     ) {
       return fail(res, 400, 'Invalid ad slot.');
+    }
+
+    /*
+     * Early cooldown check for a clear error message.
+     * The SQL RPC must still enforce the same rule to prevent
+     * simultaneous requests from bypassing the restriction.
+     */
+    const cooldowns = await getAdCooldowns(
+      req.telegramUser.id
+    );
+
+    const slot = cooldowns.find(item => item.adId === adId);
+
+    if (slot?.locked) {
+      return fail(
+        res,
+        409,
+        'This ad slot is on cooldown.',
+        {
+          adId,
+          locked: true,
+          lastWatchedAt: slot.lastWatchedAt,
+          availableAgainAt: slot.availableAgainAt,
+          remainingSeconds: slot.remainingSeconds
+        }
+      );
     }
 
     const result = await rpc('trial_start_ad_attempt', {
@@ -466,12 +573,14 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
       return fail(
         res,
         409,
-        result.reason || result.error || 'Ad attempt denied.'
+        result.reason || result.error || 'Ad attempt denied.',
+        { result }
       );
     }
 
     return res.json({
       success: true,
+      adId,
       result
     });
   } catch (error) {
@@ -486,13 +595,9 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
 });
 
 /*
- * Simple client-side claim endpoint.
- * This requires the frontend to call /adsgram/claim after
- * AdsGram's show() promise resolves successfully.
- *
- * IMPORTANT: This is not independent proof that AdsGram
- * completed an ad. For real withdrawable USDT, server-side
- * provider verification is safer.
+ * Client-side claim endpoint.
+ * The SQL function must verify that a pending attempt exists,
+ * and must reject duplicate claims for the same ad slot.
  */
 app.post('/adsgram/claim', authTelegram, async (req, res) => {
   try {
@@ -504,6 +609,30 @@ app.post('/adsgram/claim', authTelegram, async (req, res) => {
       adId > ADS_PER_24H
     ) {
       return fail(res, 400, 'Invalid ad slot.');
+    }
+
+    /*
+     * Do not claim an ad if that slot already has a verified
+     * reward in its current 24-hour window.
+     */
+    const cooldowns = await getAdCooldowns(
+      req.telegramUser.id
+    );
+
+    const slot = cooldowns.find(item => item.adId === adId);
+
+    if (slot?.locked) {
+      return fail(
+        res,
+        409,
+        'This ad slot has already been rewarded in the last 24 hours.',
+        {
+          adId,
+          locked: true,
+          availableAgainAt: slot.availableAgainAt,
+          remainingSeconds: slot.remainingSeconds
+        }
+      );
     }
 
     const result = await rpc('trial_confirm_ad_reward', {
@@ -520,11 +649,18 @@ app.post('/adsgram/claim', authTelegram, async (req, res) => {
     }
 
     const account = await getAccount(req.telegramUser);
+    const updatedSlot = account.adCooldowns.find(
+      item => item.adId === adId
+    );
 
     return res.json({
       success: true,
+      adId,
       reward: AD_REWARD,
       balance: account.balance,
+      lastWatchedAt: updatedSlot?.lastWatchedAt || null,
+      availableAgainAt: updatedSlot?.availableAgainAt || null,
+      remainingSeconds: updatedSlot?.remainingSeconds || 0,
       result
     });
   } catch (error) {
@@ -578,7 +714,7 @@ app.get('/adsgram/reward', async (req, res) => {
   }
 });
 
-/* Check whether the latest ad claim is verified. */
+/* Return the latest verified claim and individual cooldown. */
 app.post('/adsgram/status', authTelegram, async (req, res) => {
   try {
     const adId = Number(req.body?.adId);
@@ -591,32 +727,26 @@ app.post('/adsgram/status', authTelegram, async (req, res) => {
       return fail(res, 400, 'Invalid ad slot.');
     }
 
-    const { data, error } = await db
-      .from('trial_ad_claims')
-      .select('verification_status,created_at,reward_usdt')
-      .eq('telegram_id', req.telegramUser.id)
-      .eq('ad_id', adId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const cooldowns = await getAdCooldowns(
+      req.telegramUser.id
+    );
 
-    if (error) throw error;
-
-    if (!data) {
-      return fail(res, 404, 'No ad claim found.');
-    }
+    const slot = cooldowns.find(item => item.adId === adId);
 
     const account = await getAccount(req.telegramUser);
 
     return res.json({
       success: true,
-      verified: data.verification_status === 'verified',
-      reward:
-        data.verification_status === 'verified'
-          ? Number(data.reward_usdt || AD_REWARD)
-          : 0,
-      balance: account.balance,
-      verificationStatus: data.verification_status
+      ...(slot || {
+        adId,
+        verified: false,
+        locked: false,
+        lastWatchedAt: null,
+        availableAgainAt: null,
+        remainingSeconds: 0,
+        reward: 0
+      }),
+      balance: account.balance
     });
   } catch (error) {
     console.error('/adsgram/status:', error.message);
