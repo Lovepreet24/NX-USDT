@@ -56,6 +56,11 @@ const TASKS = {
 };
 const TASK_KEYS = Object.keys(TASKS);
 
+/* YouTube tasks: user must wait this long between START and VERIFY. */
+const YOUTUBE_WATCH_SECONDS = Number(process.env.YOUTUBE_WATCH_SECONDS || 35);
+/* true = reward right after the timer passes; false = goes to admin review. */
+const YOUTUBE_AUTO_APPROVE = process.env.YOUTUBE_AUTO_APPROVE !== 'false';
+
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://nxcoinwebbot.vercel.app')
   .split(',')
   .map(x => x.trim())
@@ -343,6 +348,52 @@ async function getAccount(tg) {
       youtubeTasks: 4
     }
   };
+}
+
+/* ---------- YouTube task timer (stateless signed token) ---------- */
+const YT_TOKEN_KEY = crypto
+  .createHmac('sha256', BOT_TOKEN)
+  .update('youtube-task-token')
+  .digest();
+
+function signYoutubeToken(userId, taskKey, startedAt) {
+  const sig = crypto
+    .createHmac('sha256', YT_TOKEN_KEY)
+    .update(`${userId}:${taskKey}:${startedAt}`)
+    .digest('hex');
+
+  return `${startedAt}.${sig}`;
+}
+
+function checkYoutubeToken(userId, taskKey, token) {
+  const [startedRaw, sig] = String(token || '').split('.');
+  const startedAt = Number(startedRaw);
+
+  if (!Number.isFinite(startedAt) || !sig) {
+    return { ok: false, error: 'Press START first.' };
+  }
+
+  const expected = signYoutubeToken(userId, taskKey, startedAt).split('.')[1];
+
+  if (!safeEqual(sig, expected)) {
+    return { ok: false, error: 'Invalid task token. Press START again.' };
+  }
+
+  const elapsed = Date.now() - startedAt;
+
+  if (elapsed > 2 * 60 * 60 * 1000) {
+    return { ok: false, error: 'Task expired. Press START again.' };
+  }
+
+  if (elapsed < YOUTUBE_WATCH_SECONDS * 1000) {
+    return {
+      ok: false,
+      early: true,
+      error: `Verified too early. Watch at least ${YOUTUBE_WATCH_SECONDS} seconds, then press START again.`
+    };
+  }
+
+  return { ok: true };
 }
 
 /* ---------- Telegram channel membership check ---------- */
@@ -652,6 +703,41 @@ app.post('/adsgram/status', authTelegram, async (req, res) => {
   }
 });
 
+/* YouTube task: START. Returns a signed token carrying the server start time. */
+app.post('/tasks/youtube/start', authTelegram, async (req, res) => {
+  try {
+    const taskKey = String(req.body?.taskKey || '');
+
+    if (TASKS[taskKey]?.type !== 'youtube') {
+      return fail(res, 400, 'This task is not available.');
+    }
+
+    const userId = req.telegramUser.id;
+
+    const { data: existing } = await db
+      .from('trial_task_claims')
+      .select('status')
+      .eq('telegram_id', userId)
+      .eq('task_key', taskKey)
+      .maybeSingle();
+
+    if (existing?.status === 'approved') {
+      return fail(res, 409, 'Task already approved.');
+    }
+
+    const startedAt = Date.now();
+
+    return res.json({
+      success: true,
+      token: signYoutubeToken(userId, taskKey, startedAt),
+      waitSeconds: YOUTUBE_WATCH_SECONDS
+    });
+  } catch (error) {
+    console.error('/tasks/youtube/start:', error.message);
+    return fail(res, 400, 'Could not start task.');
+  }
+});
+
 app.post('/tasks/submit', authTelegram, async (req, res) => {
   try {
     const taskKey = String(req.body?.taskKey || '');
@@ -697,6 +783,45 @@ app.post('/tasks/submit', authTelegram, async (req, res) => {
         success: true,
         result: review,
         message: 'Channel verified. Reward added!'
+      });
+    }
+
+    if (task.type === 'youtube') {
+      const check = checkYoutubeToken(userId, taskKey, req.body?.token);
+
+      if (!check.ok) {
+        return fail(res, 400, check.error, { early: Boolean(check.early) });
+      }
+
+      if (existing?.status === 'pending' && !YOUTUBE_AUTO_APPROVE) {
+        return fail(res, 409, 'Task already submitted. Waiting for admin verification.');
+      }
+
+      /* May already exist as 'pending' from an older submission, so don't fail on it. */
+      try {
+        await rpc('trial_submit_task', { p_telegram_id: userId, p_task_key: taskKey });
+      } catch (submitError) {
+        console.warn('trial_submit_task skipped:', submitError.message);
+      }
+
+      if (YOUTUBE_AUTO_APPROVE) {
+        const review = await rpc('trial_review_task', {
+          p_telegram_id: userId,
+          p_task_key: taskKey,
+          p_decision: 'approve',
+          p_reward: TASK_REWARD
+        });
+
+        return res.json({
+          success: true,
+          result: review,
+          message: 'Video verified. Reward added!'
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Submitted for admin verification.'
       });
     }
 
