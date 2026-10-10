@@ -1113,13 +1113,24 @@ app.post('/payout', authTelegram, async (req, res) => {
     let txHash = null;
 
     if (AUTO_PAYOUT_ENABLED && amount <= AUTO_PAYOUT_MAX_USDT) {
-      const { data: row } = await db
+      /* The RPC may name the ID differently, so fall back to the user's newest open payout. */
+      const payoutId = result?.payout_id ?? result?.id ?? result?.payout?.id ?? null;
+
+      let query = db
         .from('trial_payouts')
         .select('*')
-        .eq('id', result?.payout_id)
         .eq('telegram_id', req.telegramUser.id)
-        .eq('status', 'pending')
-        .maybeSingle();
+        .in('status', ['pending', 'reserved']);
+
+      query = payoutId
+        ? query.eq('id', payoutId)
+        : query.order('created_at', { ascending: false }).limit(1);
+
+      const { data: found, error: findError } = await query;
+      const row = Array.isArray(found) ? found[0] : found;
+
+      if (findError) console.error('/payout lookup failed:', findError.message);
+      if (!row) console.error('/payout: no open payout row found for auto transfer. RPC result:', JSON.stringify(result));
 
       if (row) {
         const sent = await sendPayout(row);
@@ -1452,5 +1463,6 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`NX USDT API listening on port ${PORT}`);
+  console.log(`Auto payout: ${AUTO_PAYOUT_ENABLED ? 'ON' : 'OFF'} (max ${AUTO_PAYOUT_MAX_USDT} USDT), key set: ${Boolean(PAYOUT_PRIVATE_KEY)}`);
   setupBotWebhook();
 });
