@@ -35,6 +35,16 @@ const AD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const REQUIRE_AD_CLICK = process.env.REQUIRE_AD_CLICK !== 'false';
 
+/* Ad slots where the "Go!" click is NOT required (watching the full ad is enough). */
+const NO_CLICK_AD_SLOTS = String(process.env.NO_CLICK_AD_SLOTS || '1')
+  .split(',')
+  .map(x => Number(x.trim()))
+  .filter(n => Number.isInteger(n) && n >= 1);
+
+function adNeedsClick(adId) {
+  return REQUIRE_AD_CLICK && !NO_CLICK_AD_SLOTS.includes(adId);
+}
+
 /* ---- Auto payout (BEP-20 USDT) ---- */
 const AUTO_PAYOUT_ENABLED = process.env.AUTO_PAYOUT_ENABLED === 'true';
 const AUTO_PAYOUT_MAX_USDT = Number(process.env.AUTO_PAYOUT_MAX_USDT || 20);
@@ -60,6 +70,8 @@ const TASK_KEYS = Object.keys(TASKS);
 const YOUTUBE_WATCH_SECONDS = Number(process.env.YOUTUBE_WATCH_SECONDS || 35);
 /* true = reward right after the timer passes; false = goes to admin review. */
 const YOUTUBE_AUTO_APPROVE = process.env.YOUTUBE_AUTO_APPROVE !== 'false';
+/* YouTube tasks can be done again this long after the last approval. */
+const YOUTUBE_REPEAT_MS = 24 * 60 * 60 * 1000;
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://nxcoinwebbot.vercel.app')
   .split(',')
@@ -251,6 +263,81 @@ async function getAdCooldowns(telegramId) {
   return ads;
 }
 
+/* ---------- YouTube 24h repeat (uses table trial_task_cooldowns) ---------- */
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.ceil(Number(seconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${Math.max(1, m)}m`;
+}
+
+/* Remember when a YouTube task was last approved. Never throws. */
+async function markTaskDone(userId, taskKey) {
+  if (TASKS[taskKey]?.type !== 'youtube') return;
+
+  try {
+    const { error } = await db
+      .from('trial_task_cooldowns')
+      .upsert(
+        {
+          telegram_id: String(userId),
+          task_key: taskKey,
+          completed_at: new Date().toISOString()
+        },
+        { onConflict: 'telegram_id,task_key' }
+      );
+
+    if (error) console.error('markTaskDone:', error.message);
+  } catch (error) {
+    console.error('markTaskDone:', error.message);
+  }
+}
+
+/* repeatable = a completion time is stored; remainingSeconds > 0 means still locked. */
+async function getYoutubeLock(userId, taskKey) {
+  try {
+    const { data, error } = await db
+      .from('trial_task_cooldowns')
+      .select('completed_at')
+      .eq('telegram_id', String(userId))
+      .eq('task_key', taskKey)
+      .maybeSingle();
+
+    if (error || !data) {
+      if (error) console.error('getYoutubeLock:', error.message);
+      return { repeatable: false, remainingSeconds: 0 };
+    }
+
+    const doneAt = new Date(data.completed_at).getTime();
+    if (!Number.isFinite(doneAt)) return { repeatable: false, remainingSeconds: 0 };
+
+    const remainingMs = Math.max(0, doneAt + YOUTUBE_REPEAT_MS - Date.now());
+    return { repeatable: true, remainingSeconds: Math.ceil(remainingMs / 1000) };
+  } catch (error) {
+    console.error('getYoutubeLock:', error.message);
+    return { repeatable: false, remainingSeconds: 0 };
+  }
+}
+
+async function getTaskCooldownRows(telegramId) {
+  try {
+    const { data, error } = await db
+      .from('trial_task_cooldowns')
+      .select('task_key,completed_at')
+      .eq('telegram_id', String(telegramId));
+
+    if (error) {
+      console.error('getTaskCooldownRows:', error.message);
+      return [];
+    }
+
+    return data || [];
+  } catch (error) {
+    console.error('getTaskCooldownRows:', error.message);
+    return [];
+  }
+}
+
 async function getAccount(tg) {
   const { data: user, error: userError } = await db
     .from('trial_users')
@@ -263,7 +350,7 @@ async function getAccount(tg) {
 
   const since = new Date(Date.now() - AD_COOLDOWN_MS).toISOString();
 
-  const [ads, approvedTasks, referrals, payouts, taskRows, adCooldowns] = await Promise.all([
+  const [ads, approvedTasks, referrals, payouts, taskRows, adCooldowns, cooldownRows] = await Promise.all([
     db.from('trial_ad_claims')
       .select('id', { count: 'exact', head: true })
       .eq('telegram_id', tg.id)
@@ -289,7 +376,9 @@ async function getAccount(tg) {
       .select('task_key,status')
       .eq('telegram_id', tg.id),
 
-    getAdCooldowns(tg.id)
+    getAdCooldowns(tg.id),
+
+    getTaskCooldownRows(tg.id)
   ]);
 
   for (const result of [ads, approvedTasks, referrals, payouts, taskRows]) {
@@ -299,6 +388,27 @@ async function getAccount(tg) {
   const taskStatus = {};
   for (const row of taskRows.data || []) {
     taskStatus[row.task_key] = row.status;
+  }
+
+  /* 24h countdown for approved YouTube tasks. */
+  const taskCooldowns = {};
+  const nowMs = Date.now();
+
+  for (const row of cooldownRows) {
+    if (TASKS[row.task_key]?.type !== 'youtube') continue;
+    if (taskStatus[row.task_key] !== 'approved') continue;
+
+    const doneAt = new Date(row.completed_at).getTime();
+    if (!Number.isFinite(doneAt)) continue;
+
+    const availableAt = doneAt + YOUTUBE_REPEAT_MS;
+    const remainingMs = Math.max(0, availableAt - nowMs);
+
+    taskCooldowns[row.task_key] = {
+      completedAt: row.completed_at,
+      availableAgainAt: new Date(availableAt).toISOString(),
+      remainingSeconds: Math.ceil(remainingMs / 1000)
+    };
   }
 
   const balance = Number(user.balance_usdt || 0);
@@ -323,6 +433,7 @@ async function getAccount(tg) {
     tasksCompleted,
     requiredTasks: REQUIRED_TASKS,
     taskStatus,
+    taskCooldowns,
     payouts: payouts.data || [],
 
     canWithdraw:
@@ -344,6 +455,9 @@ async function getAccount(tg) {
       requiredTasks: REQUIRED_TASKS,
       adsgramBlockId: ADSGRAM_BLOCK_ID,
       adClickRequired: REQUIRE_AD_CLICK,
+      noClickAdSlots: NO_CLICK_AD_SLOTS,
+      autoVerifyTasks: AUTO_VERIFY_TASKS,
+      youtubeAutoApprove: YOUTUBE_AUTO_APPROVE,
       autoPayoutEnabled: AUTO_PAYOUT_ENABLED,
       youtubeTasks: 4
     }
@@ -389,7 +503,7 @@ function checkYoutubeToken(userId, taskKey, token) {
     return {
       ok: false,
       early: true,
-      error: `Verified too early. Watch at least ${YOUTUBE_WATCH_SECONDS} seconds, then press START again.`
+      error: 'Verified too early. Watch the full video, then press START again.'
     };
   }
 
@@ -577,7 +691,8 @@ app.post('/adsgram/claim', authTelegram, async (req, res) => {
       return fail(res, 400, 'Invalid ad slot.');
     }
 
-    if (REQUIRE_AD_CLICK && req.body?.clicked !== true) {
+    /* Click is required on every slot except those listed in NO_CLICK_AD_SLOTS. */
+    if (adNeedsClick(adId) && req.body?.clicked !== true) {
       return fail(res, 400, 'You must click the ad button to earn the reward.', {
         clickRequired: true
       });
@@ -722,7 +837,20 @@ app.post('/tasks/youtube/start', authTelegram, async (req, res) => {
       .maybeSingle();
 
     if (existing?.status === 'approved') {
-      return fail(res, 409, 'Task already approved.');
+      const lock = await getYoutubeLock(userId, taskKey);
+
+      if (!lock.repeatable) {
+        return fail(res, 409, 'Task already approved.');
+      }
+
+      if (lock.remainingSeconds > 0) {
+        return fail(
+          res,
+          409,
+          `This task is available again in ${formatDuration(lock.remainingSeconds)}.`,
+          { remainingSeconds: lock.remainingSeconds }
+        );
+      }
     }
 
     const startedAt = Date.now();
@@ -754,15 +882,37 @@ app.post('/tasks/submit', authTelegram, async (req, res) => {
       .eq('task_key', taskKey)
       .maybeSingle();
 
+    /* Approved YouTube tasks can be repeated once their 24h lock has passed. */
+    let renewing = false;
+
     if (existing?.status === 'approved') {
-      return fail(res, 409, 'Task already approved.');
+      if (task.type !== 'youtube') {
+        return fail(res, 409, 'Task already approved.');
+      }
+
+      const lock = await getYoutubeLock(userId, taskKey);
+
+      if (!lock.repeatable) {
+        return fail(res, 409, 'Task already approved.');
+      }
+
+      if (lock.remainingSeconds > 0) {
+        return fail(
+          res,
+          409,
+          `This task is available again in ${formatDuration(lock.remainingSeconds)}.`,
+          { remainingSeconds: lock.remainingSeconds }
+        );
+      }
+
+      renewing = true;
     }
 
     if (task.type === 'telegram' && AUTO_VERIFY_TASKS) {
       const member = await isChannelMember(task.chat, userId);
 
       if (!member) {
-        return fail(res, 400, 'Join the channel first, then press submit again.');
+        return fail(res, 400, 'Join the channel first, then press START and VERIFY again.');
       }
 
       /* May already exist as 'pending' from an older submission, so don't fail on it. */
@@ -797,6 +947,17 @@ app.post('/tasks/submit', authTelegram, async (req, res) => {
         return fail(res, 409, 'Task already submitted. Waiting for admin verification.');
       }
 
+      /* New 24h round: clear the old approved claim so it can be submitted again. */
+      if (renewing) {
+        const { error: clearError } = await db
+          .from('trial_task_claims')
+          .delete()
+          .eq('telegram_id', userId)
+          .eq('task_key', taskKey);
+
+        if (clearError) throw clearError;
+      }
+
       /* May already exist as 'pending' from an older submission, so don't fail on it. */
       try {
         await rpc('trial_submit_task', { p_telegram_id: userId, p_task_key: taskKey });
@@ -811,6 +972,10 @@ app.post('/tasks/submit', authTelegram, async (req, res) => {
           p_decision: 'approve',
           p_reward: TASK_REWARD
         });
+
+        if (review?.success !== false) {
+          await markTaskDone(userId, taskKey);
+        }
 
         return res.json({
           success: true,
@@ -871,6 +1036,10 @@ app.post('/admin/task/review', authAdmin, async (req, res) => {
       p_decision: decision,
       p_reward: TASK_REWARD
     });
+
+    if (decision === 'approve' && result?.success !== false) {
+      await markTaskDone(telegramId, taskKey);
+    }
 
     return res.json({ success: true, result });
   } catch (error) {
