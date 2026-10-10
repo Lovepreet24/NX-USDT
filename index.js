@@ -387,7 +387,7 @@ async function sendPayout(payout) {
     .from('trial_payouts')
     .update({ status: 'processing' })
     .eq('id', payout.id)
-    .in('status', ['pending', 'failed'])
+    .in('status', ['pending', 'reserved', 'failed'])
     .select('id')
     .maybeSingle();
 
@@ -407,14 +407,19 @@ async function sendPayout(payout) {
     await db.from('trial_payouts').update({ tx_hash: txHash }).eq('id', payout.id);
     await tx.wait(1);
 
-    await db
-      .from('trial_payouts')
-      .update({
-        status: 'paid',
-        tx_hash: txHash,
-        processed_at: new Date().toISOString()
-      })
-      .eq('id', payout.id);
+    /* Sets status 'sent' AND deducts the user's balance in one DB transaction. */
+    try {
+      const marked = await rpc('trial_mark_payout_sent', {
+        p_payout_id: payout.id,
+        p_tx_hash: txHash
+      });
+
+      if (marked?.success !== true) {
+        console.error('Payout sent but not marked in DB:', payout.id, txHash, marked);
+      }
+    } catch (markError) {
+      console.error('Payout sent but DB update failed:', payout.id, txHash, markError.message);
+    }
 
     return { success: true, txHash };
   } catch (error) {
@@ -806,17 +811,16 @@ app.post('/payout', authTelegram, async (req, res) => {
       const { data: row } = await db
         .from('trial_payouts')
         .select('*')
+        .eq('id', result?.payout_id)
         .eq('telegram_id', req.telegramUser.id)
         .eq('status', 'pending')
-        .order('created_at', { ascending: false })
-        .limit(1)
         .maybeSingle();
 
       if (row) {
         const sent = await sendPayout(row);
 
         if (sent.success) {
-          status = 'paid';
+          status = 'sent';
           txHash = sent.txHash;
           message = 'Withdrawal sent to your wallet!';
         } else {
