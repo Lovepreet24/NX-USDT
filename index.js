@@ -55,6 +55,7 @@ const ADSGRAM_REWARD_SECRET =
 const ADS_PER_24H = 12;
 const AD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
+const REQUIRE_AD_CLICK = process.env.REQUIRE_AD_CLICK !== 'false';
 
 const ALLOWED_ORIGINS = (
   process.env.ALLOWED_ORIGINS ||
