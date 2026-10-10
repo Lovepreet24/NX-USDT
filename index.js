@@ -572,6 +572,17 @@ app.post('/adsgram/claim', authTelegram, async (req, res) => {
   }
 });
 
+/* Cancel the user's pending ad attempt (ad closed without clicking "Go!"). */
+app.post('/adsgram/cancel', authTelegram, async (req, res) => {
+  try {
+    await rpc('trial_cancel_ad_attempt', { p_telegram_id: req.telegramUser.id });
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('/adsgram/cancel:', error.message);
+    return fail(res, 500, 'Could not cancel ad attempt.');
+  }
+});
+
 /* AdsGram server-to-server Reward URL callback (disabled in click-required mode). */
 app.get('/adsgram/reward', async (req, res) => {
   try {
