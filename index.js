@@ -1173,15 +1173,44 @@ app.post('/admin/payout/process', authAdmin, async (req, res) => {
     return fail(res, 500, 'Could not process payout.');
   }
 });
+
 /* =====================================================================
-   BROADCAST (admin only)
-   Paste this block in index.js ABOVE the line:
-     app.use((req, res) => { return fail(res, 404, 'API endpoint not found.'); });
+   BROADCAST
+   1) From the bot chat: admin sends /broadcast, then the message, then YES.
+   2) Optional HTTP endpoint: POST /admin/broadcast (x-admin-secret header).
    ===================================================================== */
 
+/* Only this Telegram ID can use /broadcast in the bot. */
+const BROADCAST_ADMIN_ID = String(process.env.BROADCAST_ADMIN_ID || '8861019133');
+const PUBLIC_URL = String(process.env.PUBLIC_URL || 'https://nx-usdt-production.up.railway.app').replace(/\/+$/, '');
+const BOT_WEBHOOK_ENABLED = process.env.BOT_WEBHOOK_ENABLED !== 'false';
+const WEBHOOK_SECRET = crypto.createHash('sha256').update(`${BOT_TOKEN}:webhook`).digest('hex');
+const OPEN_APP_URL = `https://t.me/${BOT_USERNAME}/Web`;
+
 let broadcastRunning = false;
+let botDraft = null; /* { step: 'await_message' | 'await_confirm', chatId, messageId } */
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function tgApi(method, body) {
+  const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  return response.json();
+}
+
+function sendTelegramMessage(chatId, text, button) {
+  const body = { chat_id: chatId, text, disable_web_page_preview: true };
+
+  if (button?.text && button?.url) {
+    body.reply_markup = { inline_keyboard: [[{ text: button.text, url: button.url }]] };
+  }
+
+  return tgApi('sendMessage', body);
+}
 
 /* All user IDs from trial_users, fetched in pages of 1000. */
 async function getAllUserIds() {
@@ -1204,39 +1233,24 @@ async function getAllUserIds() {
   return ids;
 }
 
-async function sendTelegramMessage(chatId, text, button) {
-  const body = { chat_id: chatId, text, disable_web_page_preview: true };
-
-  if (button?.text && button?.url) {
-    body.reply_markup = { inline_keyboard: [[{ text: button.text, url: button.url }]] };
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-
-  return response.json();
-}
-
-async function runBroadcast(ids, text, button) {
+/* sendOne(id) must return Telegram's JSON result. */
+async function runBroadcast(ids, sendOne, onDone) {
   let sent = 0;
   let blocked = 0;
   let failed = 0;
 
   for (const id of ids) {
     try {
-      let result = await sendTelegramMessage(id, text, button);
+      let result = await sendOne(id);
 
       /* Telegram asks us to slow down: wait, then retry once. */
       if (!result.ok && result.error_code === 429) {
         await sleep((Number(result.parameters?.retry_after) || 5) * 1000 + 500);
-        result = await sendTelegramMessage(id, text, button);
+        result = await sendOne(id);
       }
 
       if (result.ok) sent++;
-      else if (result.error_code === 403) blocked++; /* user blocked the bot or never started it */
+      else if (result.error_code === 403) blocked++; /* blocked the bot or never started it */
       else {
         failed++;
         console.warn('Broadcast failed for', id, result.description);
@@ -1249,21 +1263,149 @@ async function runBroadcast(ids, text, button) {
     await sleep(50); /* about 20 messages per second, under Telegram's limit */
   }
 
-  console.log(`Broadcast finished. Total: ${ids.length}, sent: ${sent}, blocked/not started: ${blocked}, failed: ${failed}`);
+  const summary =
+    `Broadcast finished.\nTotal: ${ids.length}\nSent: ${sent}\nBlocked / not started: ${blocked}\nFailed: ${failed}`;
+
+  console.log(summary.replace(/\n/g, ' | '));
+
+  if (onDone) {
+    try { await onDone(summary); } catch (_) {}
+  }
+}
+
+/* ---------- Bot chat commands (via webhook) ---------- */
+async function handleBotUpdate(update) {
+  const msg = update?.message;
+  if (!msg || msg.chat?.type !== 'private') return;
+
+  const fromId = String(msg.from?.id || '');
+  const chatId = String(msg.chat.id);
+  const text = typeof msg.text === 'string' ? msg.text.trim() : '';
+  const command = text.startsWith('/') ? text.split(/[\s@]/)[0].toLowerCase() : '';
+
+  if (command === '/start') {
+    await sendTelegramMessage(
+      chatId,
+      'Welcome to NX USDT! Tap the button below to open the app and start earning.',
+      { text: '🚀 Open NX USDT', url: OPEN_APP_URL }
+    );
+    return;
+  }
+
+  /* Everything below is admin only. Other users are ignored. */
+  if (fromId !== BROADCAST_ADMIN_ID) return;
+
+  if (command === '/cancel') {
+    botDraft = null;
+    await sendTelegramMessage(chatId, 'Cancelled.');
+    return;
+  }
+
+  if (command === '/broadcast') {
+    if (broadcastRunning) {
+      await sendTelegramMessage(chatId, 'A broadcast is already running. Please wait for it to finish.');
+      return;
+    }
+
+    botDraft = { step: 'await_message' };
+    await sendTelegramMessage(
+      chatId,
+      'Send the message you want to broadcast (text, photo, anything).\nSend /cancel to stop.'
+    );
+    return;
+  }
+
+  if (botDraft?.step === 'await_message') {
+    const ids = await getAllUserIds();
+
+    botDraft = { step: 'await_confirm', chatId, messageId: msg.message_id };
+
+    await sendTelegramMessage(
+      chatId,
+      `Send the message above to ${ids.length} users?\nReply YES to confirm, or /cancel.`
+    );
+    return;
+  }
+
+  if (botDraft?.step === 'await_confirm') {
+    if (text.toLowerCase() !== 'yes') {
+      await sendTelegramMessage(chatId, 'Reply YES to send, or /cancel to stop.');
+      return;
+    }
+
+    if (broadcastRunning) {
+      await sendTelegramMessage(chatId, 'A broadcast is already running. Please wait for it to finish.');
+      return;
+    }
+
+    const draft = botDraft;
+    botDraft = null;
+
+    const ids = await getAllUserIds();
+    broadcastRunning = true;
+
+    await sendTelegramMessage(chatId, `Broadcast started to ${ids.length} users. I will message you when it finishes.`);
+
+    const markup = { inline_keyboard: [[{ text: '🚀 Open NX USDT', url: OPEN_APP_URL }]] };
+
+    runBroadcast(
+      ids,
+      id => tgApi('copyMessage', {
+        chat_id: id,
+        from_chat_id: draft.chatId,
+        message_id: draft.messageId,
+        reply_markup: markup
+      }),
+      summary => sendTelegramMessage(chatId, summary)
+    )
+      .catch(error => console.error('Broadcast crashed:', error.message))
+      .finally(() => { broadcastRunning = false; });
+  }
+}
+
+app.post('/telegram/webhook', async (req, res) => {
+  if (!safeEqual(req.headers['x-telegram-bot-api-secret-token'], WEBHOOK_SECRET)) {
+    return res.sendStatus(401);
+  }
+
+  /* Answer Telegram immediately, then handle the update. */
+  res.sendStatus(200);
+
+  try {
+    await handleBotUpdate(req.body);
+  } catch (error) {
+    console.error('Bot update error:', error.message);
+  }
+});
+
+async function setupBotWebhook() {
+  if (!BOT_WEBHOOK_ENABLED) return;
+
+  try {
+    const result = await tgApi('setWebhook', {
+      url: `${PUBLIC_URL}/telegram/webhook`,
+      secret_token: WEBHOOK_SECRET,
+      allowed_updates: ['message']
+    });
+
+    console.log(result.ok ? 'Bot webhook set.' : `Bot webhook failed: ${result.description}`);
+  } catch (error) {
+    console.error('Bot webhook error:', error.message);
+  }
 }
 
 /*
-  Body (JSON):
+  Optional HTTP version. Body (JSON):
     message     required, up to 4000 characters
     buttonText  optional, e.g. "Open NX USDT"
-    buttonUrl   optional, defaults to your Mini App link when buttonText is given
-    testId      optional, send ONLY to this Telegram ID (use it to test first)
+    buttonUrl   optional, defaults to your Mini App link
+    testId      optional, send ONLY to this Telegram ID
 */
 app.post('/admin/broadcast', authAdmin, async (req, res) => {
   try {
     const message = String(req.body?.message || '').trim();
     const buttonText = String(req.body?.buttonText || '').trim().slice(0, 64);
-    const buttonUrl = String(req.body?.buttonUrl || `https://t.me/${BOT_USERNAME}/Web`).trim();
+    const buttonUrl = String(req.body?.buttonUrl || OPEN_APP_URL).trim();
     const testId = req.body?.testId ? String(req.body.testId) : null;
 
     if (!message || message.length > 4000) {
@@ -1287,10 +1429,9 @@ app.post('/admin/broadcast', authAdmin, async (req, res) => {
 
     broadcastRunning = true;
 
-    /* Reply right away; sending continues in the background. Result is in Railway logs. */
     res.json({ success: true, recipients: ids.length, message: 'Broadcast started. Check Railway logs for the result.' });
 
-    runBroadcast(ids, message, button)
+    runBroadcast(ids, id => sendTelegramMessage(id, message, button))
       .catch(error => console.error('Broadcast crashed:', error.message))
       .finally(() => { broadcastRunning = false; });
   } catch (error) {
@@ -1298,6 +1439,7 @@ app.post('/admin/broadcast', authAdmin, async (req, res) => {
     return fail(res, 500, 'Could not start broadcast.');
   }
 });
+
 app.use((req, res) => {
   return fail(res, 404, 'API endpoint not found.');
 });
@@ -1310,4 +1452,5 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`NX USDT API listening on port ${PORT}`);
+  setupBotWebhook();
 });
