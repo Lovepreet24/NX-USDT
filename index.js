@@ -56,7 +56,7 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 
 const ALLOWED_ORIGINS = (
   process.env.ALLOWED_ORIGINS ||
-  'https://nxcoin.vercel.app'
+  'https://nxcoinwebbot.vercel.app'
 )
   .split(',')
   .map(x => x.trim())
@@ -442,6 +442,7 @@ app.post('/account', authTelegram, async (req, res) => {
   }
 });
 
+/* Start an ad attempt. This does not credit any reward. */
 app.post('/adsgram/start', authTelegram, async (req, res) => {
   try {
     const adId = Number(req.body?.adId);
@@ -465,7 +466,7 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
       return fail(
         res,
         409,
-        result.error || result.reason || 'Ad attempt denied.'
+        result.reason || result.error || 'Ad attempt denied.'
       );
     }
 
@@ -485,13 +486,54 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
 });
 
 /*
- * AdsGram Reward URL:
- * https://nx-usdt-production.up.railway.app/adsgram/reward
- *   ?secret=YOUR_SECRET&userid=[userId]
+ * Simple client-side claim endpoint.
+ * This requires the frontend to call /adsgram/claim after
+ * AdsGram's show() promise resolves successfully.
  *
- * This callback must not credit rewards unless the matching
- * Supabase RPC verifies and atomically consumes a pending attempt.
+ * IMPORTANT: This is not independent proof that AdsGram
+ * completed an ad. For real withdrawable USDT, server-side
+ * provider verification is safer.
  */
+app.post('/adsgram/claim', authTelegram, async (req, res) => {
+  try {
+    const adId = Number(req.body?.adId);
+
+    if (
+      !Number.isInteger(adId) ||
+      adId < 1 ||
+      adId > ADS_PER_24H
+    ) {
+      return fail(res, 400, 'Invalid ad slot.');
+    }
+
+    const result = await rpc('trial_confirm_ad_reward', {
+      p_telegram_id: req.telegramUser.id,
+      p_reward_usdt: AD_REWARD
+    });
+
+    if (result?.success !== true) {
+      return fail(
+        res,
+        409,
+        result?.reason || 'No valid pending ad attempt.'
+      );
+    }
+
+    const account = await getAccount(req.telegramUser);
+
+    return res.json({
+      success: true,
+      reward: AD_REWARD,
+      balance: account.balance,
+      result
+    });
+  } catch (error) {
+    console.error('/adsgram/claim:', error.message);
+    return fail(res, 400, 'Could not claim ad reward.');
+  }
+});
+
+/* AdsGram server-to-server Reward URL callback. */
 app.get('/adsgram/reward', async (req, res) => {
   try {
     if (!ADSGRAM_REWARD_SECRET) {
@@ -515,23 +557,14 @@ app.get('/adsgram/reward', async (req, res) => {
       return res.status(400).send('Invalid user ID.');
     }
 
-    /*
-     * The current trial_confirm_ad_reward SQL function is a
-     * deliberate no-credit placeholder. Do not treat its result
-     * as a successful reward until it is replaced with an atomic
-     * pending-attempt verification function.
-     */
     const result = await rpc('trial_confirm_ad_reward', {
       p_telegram_id: userId,
       p_reward_usdt: AD_REWARD
     });
 
-    if (
-      result?.success === false ||
-      result?.credited !== true
-    ) {
+    if (result?.success !== true) {
       return res.status(409).send(
-        'Reward not credited: verified pending attempt required.'
+        String(result?.reason || 'Reward not credited.')
       );
     }
 
@@ -545,6 +578,7 @@ app.get('/adsgram/reward', async (req, res) => {
   }
 });
 
+/* Check whether the latest ad claim is verified. */
 app.post('/adsgram/status', authTelegram, async (req, res) => {
   try {
     const adId = Number(req.body?.adId);
@@ -697,7 +731,11 @@ app.post('/payout', authTelegram, async (req, res) => {
     }
 
     if (!ethers.isAddress(walletAddress)) {
-      return fail(res, 400, 'Enter a valid BEP-20 wallet address.');
+      return fail(
+        res,
+        400,
+        'Enter a valid BEP-20 wallet address.'
+      );
     }
 
     const account = await getAccount(req.telegramUser);
@@ -718,10 +756,6 @@ app.post('/payout', authTelegram, async (req, res) => {
       );
     }
 
-    /*
-     * The SQL function currently accepts exactly these
-     * three parameters. Do not pass the old extra arguments.
-     */
     const result = await rpc('trial_request_payout', {
       p_telegram_id: req.telegramUser.id,
       p_amount_usdt: amount,
