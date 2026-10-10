@@ -1240,7 +1240,7 @@ app.post('/admin/payout/process', authAdmin, async (req, res) => {
    ===================================================================== */
 
 /* Only this Telegram ID can use /broadcast in the bot. */
-const BROADCAST_ADMIN_ID = String(process.env.BROADCAST_ADMIN_ID || '8861019133');
+const BROADCAST_ADMIN_ID = String(process.env.BROADCAST_ADMIN_ID || '7982111846');
 const PUBLIC_URL = String(process.env.PUBLIC_URL || 'https://nx-usdt-production.up.railway.app').replace(/\/+$/, '');
 const BOT_WEBHOOK_ENABLED = process.env.BOT_WEBHOOK_ENABLED !== 'false';
 const WEBHOOK_SECRET = crypto.createHash('sha256').update(`${BOT_TOKEN}:webhook`).digest('hex');
