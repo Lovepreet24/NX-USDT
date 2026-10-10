@@ -1173,7 +1173,131 @@ app.post('/admin/payout/process', authAdmin, async (req, res) => {
     return fail(res, 500, 'Could not process payout.');
   }
 });
+/* =====================================================================
+   BROADCAST (admin only)
+   Paste this block in index.js ABOVE the line:
+     app.use((req, res) => { return fail(res, 404, 'API endpoint not found.'); });
+   ===================================================================== */
 
+let broadcastRunning = false;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/* All user IDs from trial_users, fetched in pages of 1000. */
+async function getAllUserIds() {
+  const ids = [];
+  const page = 1000;
+
+  for (let from = 0; ; from += page) {
+    const { data, error } = await db
+      .from('trial_users')
+      .select('telegram_id')
+      .order('telegram_id')
+      .range(from, from + page - 1);
+
+    if (error) throw error;
+
+    for (const row of data || []) ids.push(String(row.telegram_id));
+    if (!data || data.length < page) break;
+  }
+
+  return ids;
+}
+
+async function sendTelegramMessage(chatId, text, button) {
+  const body = { chat_id: chatId, text, disable_web_page_preview: true };
+
+  if (button?.text && button?.url) {
+    body.reply_markup = { inline_keyboard: [[{ text: button.text, url: button.url }]] };
+  }
+
+  const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  return response.json();
+}
+
+async function runBroadcast(ids, text, button) {
+  let sent = 0;
+  let blocked = 0;
+  let failed = 0;
+
+  for (const id of ids) {
+    try {
+      let result = await sendTelegramMessage(id, text, button);
+
+      /* Telegram asks us to slow down: wait, then retry once. */
+      if (!result.ok && result.error_code === 429) {
+        await sleep((Number(result.parameters?.retry_after) || 5) * 1000 + 500);
+        result = await sendTelegramMessage(id, text, button);
+      }
+
+      if (result.ok) sent++;
+      else if (result.error_code === 403) blocked++; /* user blocked the bot or never started it */
+      else {
+        failed++;
+        console.warn('Broadcast failed for', id, result.description);
+      }
+    } catch (error) {
+      failed++;
+      console.warn('Broadcast error for', id, error.message);
+    }
+
+    await sleep(50); /* about 20 messages per second, under Telegram's limit */
+  }
+
+  console.log(`Broadcast finished. Total: ${ids.length}, sent: ${sent}, blocked/not started: ${blocked}, failed: ${failed}`);
+}
+
+/*
+  Body (JSON):
+    message     required, up to 4000 characters
+    buttonText  optional, e.g. "Open NX USDT"
+    buttonUrl   optional, defaults to your Mini App link when buttonText is given
+    testId      optional, send ONLY to this Telegram ID (use it to test first)
+*/
+app.post('/admin/broadcast', authAdmin, async (req, res) => {
+  try {
+    const message = String(req.body?.message || '').trim();
+    const buttonText = String(req.body?.buttonText || '').trim().slice(0, 64);
+    const buttonUrl = String(req.body?.buttonUrl || `https://t.me/${BOT_USERNAME}/Web`).trim();
+    const testId = req.body?.testId ? String(req.body.testId) : null;
+
+    if (!message || message.length > 4000) {
+      return fail(res, 400, 'Message is required (max 4000 characters).');
+    }
+
+    if (testId && !/^\d{1,20}$/.test(testId)) {
+      return fail(res, 400, 'Invalid testId.');
+    }
+
+    if (buttonText && !/^https:\/\//.test(buttonUrl)) {
+      return fail(res, 400, 'buttonUrl must start with https://');
+    }
+
+    if (broadcastRunning) {
+      return fail(res, 409, 'A broadcast is already running.');
+    }
+
+    const ids = testId ? [testId] : await getAllUserIds();
+    const button = buttonText ? { text: buttonText, url: buttonUrl } : null;
+
+    broadcastRunning = true;
+
+    /* Reply right away; sending continues in the background. Result is in Railway logs. */
+    res.json({ success: true, recipients: ids.length, message: 'Broadcast started. Check Railway logs for the result.' });
+
+    runBroadcast(ids, message, button)
+      .catch(error => console.error('Broadcast crashed:', error.message))
+      .finally(() => { broadcastRunning = false; });
+  } catch (error) {
+    console.error('/admin/broadcast:', error.message);
+    return fail(res, 500, 'Could not start broadcast.');
+  }
+});
 app.use((req, res) => {
   return fail(res, 404, 'API endpoint not found.');
 });
