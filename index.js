@@ -1501,7 +1501,7 @@ app.post('/admin/broadcast', authAdmin, async (req, res) => {
     return fail(res, 500, 'Could not start broadcast.');
   }
 });
-
+// FAAAAAAAAAAAAAAAAhhhhhhhhhhhhh
 app.use((req, res) => {
   return fail(res, 404, 'API endpoint not found.');
 });
