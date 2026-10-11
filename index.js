@@ -32,10 +32,8 @@ const ADSGRAM_REWARD_SECRET = process.env.ADSGRAM_REWARD_SECRET || '';
 
 const ADS_PER_24H = 12;
 /* Each ad slot is locked this long after a reward; ads are also counted inside this window. */
-const AD_COOLDOWN_HOURS = Number(process.env.AD_COOLDOWN_HOURS) > 0 ? Number(process.env.AD_COOLDOWN_HOURS) : 8;
+const AD_COOLDOWN_HOURS = Math.min(24, Math.max(1, Math.round(Number(process.env.AD_COOLDOWN_HOURS) || 8)));
 const AD_COOLDOWN_MS = AD_COOLDOWN_HOURS * 60 * 60 * 1000;
-/* Daily cap passed to the SQL function: every slot can be used once per cooldown window. */
-const MAX_ADS_PER_DAY = ADS_PER_24H * Math.max(1, Math.floor(24 / AD_COOLDOWN_HOURS));
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const REQUIRE_AD_CLICK = process.env.REQUIRE_AD_CLICK !== 'false';
 
@@ -721,7 +719,8 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
       p_telegram_id: req.telegramUser.id,
       p_ad_id: adId,
       p_reward_usdt: AD_REWARD,
-      p_max_ads_24h: MAX_ADS_PER_DAY
+      p_max_ads_24h: ADS_PER_24H,
+      p_cooldown_hours: AD_COOLDOWN_HOURS
     });
 
     if (result?.success === false) {
