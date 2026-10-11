@@ -31,7 +31,11 @@ const ADSGRAM_BLOCK_ID = String(process.env.ADSGRAM_BLOCK_ID || '52783');
 const ADSGRAM_REWARD_SECRET = process.env.ADSGRAM_REWARD_SECRET || '';
 
 const ADS_PER_24H = 12;
-const AD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+/* Each ad slot is locked this long after a reward; ads are also counted inside this window. */
+const AD_COOLDOWN_HOURS = Number(process.env.AD_COOLDOWN_HOURS) > 0 ? Number(process.env.AD_COOLDOWN_HOURS) : 8;
+const AD_COOLDOWN_MS = AD_COOLDOWN_HOURS * 60 * 60 * 1000;
+/* Daily cap passed to the SQL function: every slot can be used once per cooldown window. */
+const MAX_ADS_PER_DAY = ADS_PER_24H * Math.max(1, Math.floor(24 / AD_COOLDOWN_HOURS));
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const REQUIRE_AD_CLICK = process.env.REQUIRE_AD_CLICK !== 'false';
 
@@ -450,7 +454,7 @@ async function getAccount(tg) {
       minWithdrawalUSDT: MIN_WITHDRAWAL,
       maxWithdrawalUSDT: MAX_WITHDRAWAL,
       adsPer24Hours: ADS_PER_24H,
-      adCooldownHours: 24,
+      adCooldownHours: AD_COOLDOWN_HOURS,
       requiredAds: REQUIRED_ADS,
       requiredTasks: REQUIRED_TASKS,
       adsgramBlockId: ADSGRAM_BLOCK_ID,
@@ -717,7 +721,7 @@ app.post('/adsgram/start', authTelegram, async (req, res) => {
       p_telegram_id: req.telegramUser.id,
       p_ad_id: adId,
       p_reward_usdt: AD_REWARD,
-      p_max_ads_24h: ADS_PER_24H
+      p_max_ads_24h: MAX_ADS_PER_DAY
     });
 
     if (result?.success === false) {
@@ -750,7 +754,7 @@ app.post('/adsgram/claim', authTelegram, async (req, res) => {
     const slot = cooldowns.find(item => item.adId === adId);
 
     if (slot?.locked) {
-      return fail(res, 409, 'This ad slot has already been rewarded in the last 24 hours.', {
+      return fail(res, 409, `This ad slot has already been rewarded in the last ${AD_COOLDOWN_HOURS} hours.`, {
         adId,
         locked: true,
         availableAgainAt: slot.availableAgainAt,
@@ -1240,7 +1244,7 @@ app.post('/admin/payout/process', authAdmin, async (req, res) => {
    ===================================================================== */
 
 /* Only this Telegram ID can use /broadcast in the bot. */
-const BROADCAST_ADMIN_ID = String(process.env.BROADCAST_ADMIN_ID || '7982111846');
+const BROADCAST_ADMIN_ID = String(process.env.BROADCAST_ADMIN_ID || '8861019133');
 const PUBLIC_URL = String(process.env.PUBLIC_URL || 'https://nx-usdt-production.up.railway.app').replace(/\/+$/, '');
 const BOT_WEBHOOK_ENABLED = process.env.BOT_WEBHOOK_ENABLED !== 'false';
 const WEBHOOK_SECRET = crypto.createHash('sha256').update(`${BOT_TOKEN}:webhook`).digest('hex');
@@ -1511,6 +1515,7 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`NX USDT API listening on port ${PORT}`);
+  console.log(`Ad cooldown/reset window: ${AD_COOLDOWN_HOURS}h, required ads: ${REQUIRED_ADS}, required tasks: ${REQUIRED_TASKS}`);
   console.log(`Auto payout: ${AUTO_PAYOUT_ENABLED ? 'ON' : 'OFF'} (max ${AUTO_PAYOUT_MAX_USDT} USDT), key set: ${Boolean(PAYOUT_PRIVATE_KEY)}`);
   setupBotWebhook();
 });
