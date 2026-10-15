@@ -1336,14 +1336,8 @@ async function handleBotUpdate(update) {
   const text = typeof msg.text === 'string' ? msg.text.trim() : '';
   const command = text.startsWith('/') ? text.split(/[\s@]/)[0].toLowerCase() : '';
 
-  if (command === '/start') {
-    await sendTelegramMessage(
-      chatId,
-      'Welcome to NX USDT! Tap the button below to open the app and start earning.',
-      { text: '🚀 Open NX USDT', url: OPEN_APP_URL }
-    );
-    return;
-  }
+  /* /start: the bot stays silent (no reply). */
+  if (command === '/start') return;
 
   /* Everything below is admin only. Other users are ignored. */
   if (fromId !== BROADCAST_ADMIN_ID) return;
