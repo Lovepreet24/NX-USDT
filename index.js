@@ -540,32 +540,23 @@ function escapeHtml(value) {
 /* Never throws. The bot must be an admin of the channel with permission to post. */
 async function announcePayout(payout, txHash) {
   try {
-    const { data: user } = await db
-      .from('trial_users')
-      .select('username')
-      .eq('telegram_id', payout.telegram_id)
-      .maybeSingle();
-
     const wallet = String(payout.wallet_address || '');
-    const shortWallet = wallet.length > 16 ? `${wallet.slice(0, 8)}...${wallet.slice(-6)}` : wallet;
-    const username = user?.username ? `@${escapeHtml(user.username)}` : 'Hidden';
+    const amount = Number(Number(payout.amount_usdt).toFixed(2));
 
     const text =
-      `💸 <b>NX COIN — PAYMENT SENT</b>\n\n` +
-      `🆔 User ID: <code>${escapeHtml(payout.telegram_id)}</code>\n` +
-      `👤 Username: ${username}\n\n` +
-      `🪙 Amount: ${Number(payout.amount_usdt).toFixed(2)} USDT\n` +
-      `🌐 Network: <code>BSC</code>\n\n` +
-      `👛 Wallet:\n<code>${escapeHtml(shortWallet)}</code>\n\n` +
-      `🔗 TX Hash:\n<code>${escapeHtml(txHash)}</code>\n\n` +
-      `🌐 BSCScan:\n<a href="https://bscscan.com/tx/${encodeURIComponent(txHash)}">View Transaction</a>\n\n` +
-      `✅ Status: PAID`;
+      `✅ <b>New Withdrawal Payout</b>\n\n` +
+      `👤 <b>User ID:</b> ${escapeHtml(payout.telegram_id)}\n` +
+      `💰 <b>Amount:</b> ${amount} USDT\n` +
+      `🆔 <b>Address:</b>\n<code>${escapeHtml(wallet)}</code>`;
 
     const result = await tgApi('sendMessage', {
       chat_id: PAYOUT_ANNOUNCE_CHAT,
       text,
       parse_mode: 'HTML',
-      disable_web_page_preview: true
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [[{ text: '🚀 Earn USDT', url: OPEN_APP_URL }]]
+      }
     });
 
     if (!result.ok) console.error('Payout announcement failed:', result.description);
