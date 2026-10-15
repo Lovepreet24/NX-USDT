@@ -545,7 +545,7 @@ async function announcePayout(payout, txHash) {
 
     const text =
       `✅ <b>New Withdrawal Payout</b>\n\n` +
-      `👤 <b>User ID:</b> ${escapeHtml(payout.telegram_id)}\n` +
+      `👤 <b>User ID:</b> <code>${escapeHtml(payout.telegram_id)}</code>\n` +
       `💰 <b>Amount:</b> ${amount} USDT\n` +
       `🆔 <b>Address:</b>\n<code>${escapeHtml(wallet)}</code>`;
 
