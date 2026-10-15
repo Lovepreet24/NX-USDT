@@ -724,6 +724,36 @@ app.post('/account', authTelegram, async (req, res) => {
   }
 });
 
+/* Very light check used by the app for instant updates (balance and referral count only). */
+app.post('/quick', authTelegram, async (req, res) => {
+  try {
+    const [userResult, refResult] = await Promise.all([
+      db.from('trial_users')
+        .select('balance_usdt')
+        .eq('telegram_id', req.telegramUser.id)
+        .maybeSingle(),
+
+      db.from('trial_users')
+        .select('telegram_id', { count: 'exact', head: true })
+        .eq('referred_by', req.telegramUser.id)
+    ]);
+
+    if (userResult.error) throw userResult.error;
+    if (refResult.error) throw refResult.error;
+
+    if (!userResult.data) return fail(res, 404, 'Account not initialized.');
+
+    return res.json({
+      success: true,
+      balance: Number(userResult.data.balance_usdt || 0),
+      referrals: refResult.count || 0
+    });
+  } catch (error) {
+    console.error('/quick:', error.message);
+    return fail(res, 500, 'Could not check updates.');
+  }
+});
+
 /* Start an ad attempt. The SQL function must enforce cooldown atomically. */
 app.post('/adsgram/start', authTelegram, async (req, res) => {
   try {
