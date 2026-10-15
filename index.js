@@ -565,6 +565,29 @@ async function announcePayout(payout, txHash) {
   }
 }
 
+/* Tells the inviter in the bot that a new referral joined. Never throws. */
+async function notifyReferrer(referrerId, newUserId) {
+  try {
+    const { data: newUser } = await db
+      .from('trial_users')
+      .select('referred_by')
+      .eq('telegram_id', newUserId)
+      .maybeSingle();
+
+    /* Only when the referral was really registered for this inviter. */
+    if (!newUser || String(newUser.referred_by) !== String(referrerId)) return;
+
+    const result = await tgApi('sendMessage', {
+      chat_id: referrerId,
+      text: `🎉 Congratulations, You Got ${REFERRAL_REWARD} USDT For Inviting New Referral!`
+    });
+
+    if (!result.ok) console.warn('Referral message not sent:', result.description);
+  } catch (error) {
+    console.warn('Referral message error:', error.message);
+  }
+}
+
 /* ---------- Auto payout ---------- */
 let usdtContract = null;
 
@@ -658,6 +681,19 @@ app.post('/sync', authTelegram, async (req, res) => {
     let referrerId = /^ref_\d{1,20}$/.test(startParam) ? startParam.slice(4) : null;
     if (referrerId === tg.id) referrerId = null;
 
+    /* Referral message: only checked when the user arrives through a referral link. */
+    let wasExistingUser = true;
+
+    if (referrerId) {
+      const { data: existingUser } = await db
+        .from('trial_users')
+        .select('telegram_id')
+        .eq('telegram_id', tg.id)
+        .maybeSingle();
+
+      wasExistingUser = Boolean(existingUser);
+    }
+
     await rpc('trial_sync_user', {
       p_telegram_id: tg.id,
       p_first_name: tg.first_name,
@@ -667,6 +703,10 @@ app.post('/sync', authTelegram, async (req, res) => {
       p_joining_bonus: JOINING_BONUS,
       p_referral_reward: REFERRAL_REWARD
     });
+
+    if (referrerId && !wasExistingUser) {
+      notifyReferrer(referrerId, tg.id).catch(() => {});
+    }
 
     return res.json({ success: true, ...(await getAccount(tg)) });
   } catch (error) {
