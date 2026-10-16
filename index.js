@@ -537,29 +537,46 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
 }
 
-/* Never throws. The bot must be an admin of the channel with permission to post. */
-async function announcePayout(payout, txHash) {
+/* Never throws. status = 'success' or 'failed'. Sends to the channel AND to the user. */
+async function announcePayout(payout, txHash, status = 'success') {
+  const failed = status === 'failed';
+
   try {
     const wallet = String(payout.wallet_address || '');
     const amount = Number(Number(payout.amount_usdt).toFixed(2));
 
     const text =
-      `✅ <b>New Withdrawal Payout</b>\n\n` +
+      (failed
+        ? `❌ <b>Withdrawal Payout Failed</b>\n\n`
+        : `✅ <b>New Withdrawal Payout</b>\n\n`) +
       `👤 <b>User ID:</b> <code>${escapeHtml(payout.telegram_id)}</code>\n` +
       `💰 <b>Amount:</b> ${amount} USDT\n` +
       `🆔 <b>Address:</b>\n<code>${escapeHtml(wallet)}</code>`;
 
-    const result = await tgApi('sendMessage', {
-      chat_id: PAYOUT_ANNOUNCE_CHAT,
+    const body = {
       text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       reply_markup: {
         inline_keyboard: [[{ text: '🚀 Earn USDT', url: OPEN_APP_URL }]]
       }
-    });
+    };
 
-    if (!result.ok) console.error('Payout announcement failed:', result.description);
+    /* 1) Payout channel */
+    try {
+      const result = await tgApi('sendMessage', { ...body, chat_id: PAYOUT_ANNOUNCE_CHAT });
+      if (!result.ok) console.error('Payout announcement failed:', result.description);
+    } catch (error) {
+      console.error('Payout announcement error:', error.message);
+    }
+
+    /* 2) Same message privately to the user */
+    try {
+      const dm = await tgApi('sendMessage', { ...body, chat_id: String(payout.telegram_id) });
+      if (!dm.ok) console.warn('Payout DM not sent:', dm.description);
+    } catch (error) {
+      console.warn('Payout DM error:', error.message);
+    }
   } catch (error) {
     console.error('Payout announcement error:', error.message);
   }
@@ -656,6 +673,9 @@ async function sendPayout(payout) {
 
     if (!txHash) {
       await db.from('trial_payouts').update({ status: 'failed' }).eq('id', payout.id);
+
+      /* Failed notice to channel + user (BNB gas / USDT balance khatam hone par yahi dikhega) */
+      announcePayout(payout, null, 'failed').catch(() => {});
     } else {
       /* Transaction was broadcast: leave 'processing' and verify on BscScan manually. */
       console.error('Transaction was sent, verify manually:', txHash);
