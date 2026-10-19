@@ -37,6 +37,9 @@ const AD_COOLDOWN_MS = AD_COOLDOWN_HOURS * 60 * 60 * 1000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const REQUIRE_AD_CLICK = process.env.REQUIRE_AD_CLICK !== 'false';
 
+/* Only this Telegram ID can use the "Referral Lookup" button in the Mini App. */
+const ADMIN_LOOKUP_ID = '7982111846';
+
 /* Ad slots where the "Go!" click is NOT required (watching the full ad is enough). */
 const NO_CLICK_AD_SLOTS = String(process.env.NO_CLICK_AD_SLOTS || '1')
   .split(',')
@@ -771,6 +774,76 @@ app.post('/quick', authTelegram, async (req, res) => {
   } catch (error) {
     console.error('/quick:', error.message);
     return fail(res, 500, 'Could not check updates.');
+  }
+});
+
+/* Admin only (ADMIN_LOOKUP_ID): sends the full referral list of any user ID to the admin's bot chat. */
+app.post('/admin/referrals', authTelegram, async (req, res) => {
+  try {
+    if (req.telegramUser.id !== ADMIN_LOOKUP_ID) {
+      return fail(res, 403, 'Not allowed.');
+    }
+
+    const targetId = String(req.body?.targetId || '').trim().replace(/^ref_/i, '');
+
+    if (!/^\d{1,20}$/.test(targetId)) {
+      return fail(res, 400, 'Enter a valid user ID.');
+    }
+
+    const rows = [];
+    const page = 1000;
+
+    for (let from = 0; ; from += page) {
+      const { data, error } = await db
+        .from('trial_users')
+        .select('telegram_id,username')
+        .eq('referred_by', targetId)
+        .order('telegram_id')
+        .range(from, from + page - 1);
+
+      if (error) throw error;
+
+      for (const row of data || []) rows.push(row);
+      if (!data || data.length < page) break;
+    }
+
+    const header = `👥 Referrals of user ${targetId}\nTotal: ${rows.length}`;
+
+    if (!rows.length) {
+      await sendTelegramMessage(ADMIN_LOOKUP_ID, `${header}\n\nNo referrals found.`);
+      return res.json({ success: true, total: 0 });
+    }
+
+    const lines = rows.map((row, index) =>
+      `${index + 1}. ${row.telegram_id} | ${row.username ? '@' + row.username : 'no username'}`
+    );
+
+    /* Telegram allows 4096 characters per message, so split long lists. */
+    const chunks = [];
+    let current = header + '\n';
+
+    for (const line of lines) {
+      if ((current + '\n' + line).length > 3800) {
+        chunks.push(current);
+        current = '';
+      }
+      current += '\n' + line;
+    }
+    if (current.trim()) chunks.push(current);
+
+    for (const chunk of chunks) {
+      const sent = await sendTelegramMessage(ADMIN_LOOKUP_ID, chunk);
+      if (!sent.ok) {
+        console.error('/admin/referrals send failed:', sent.description);
+        return fail(res, 500, 'Could not send the list. Open the bot chat and press Start first.');
+      }
+      await sleep(50);
+    }
+
+    return res.json({ success: true, total: rows.length });
+  } catch (error) {
+    console.error('/admin/referrals:', error.message);
+    return fail(res, 500, 'Could not load referrals.');
   }
 });
 
