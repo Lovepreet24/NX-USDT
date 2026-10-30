@@ -64,12 +64,17 @@ const AUTO_VERIFY_TASKS = process.env.AUTO_VERIFY_TASKS !== 'false';
 const TASKS = {
   telegram_earn: { type: 'telegram', chat: process.env.CHANNEL_EARN || '@NXUSDTEarn' },
   telegram_payout: { type: 'telegram', chat: process.env.CHANNEL_PAYOUT || '@NXUSDTPayout' },
+  x_follow: { type: 'x' },
   youtube_1: { type: 'youtube' },
   youtube_2: { type: 'youtube' },
   youtube_3: { type: 'youtube' },
   youtube_4: { type: 'youtube' }
 };
 const TASK_KEYS = Object.keys(TASKS);
+
+/* X (Twitter) follow task: X follows cannot be checked automatically.
+   true = reward right after the user presses VERIFY; false = goes to admin review. */
+const X_AUTO_APPROVE = process.env.X_AUTO_APPROVE !== 'false';
 
 /* YouTube tasks: user must wait this long between START and VERIFY. */
 const YOUTUBE_WATCH_SECONDS = Number(process.env.YOUTUBE_WATCH_SECONDS || 35);
@@ -1138,6 +1143,29 @@ app.post('/tasks/submit', authTelegram, async (req, res) => {
         success: true,
         result: review,
         message: 'Channel verified. Reward added!'
+      });
+    }
+
+    /* X (Twitter) follow: cannot be checked automatically, so the reward is given on VERIFY. */
+    if (task.type === 'x' && X_AUTO_APPROVE) {
+      /* May already exist as 'pending' from an older submission, so don't fail on it. */
+      try {
+        await rpc('trial_submit_task', { p_telegram_id: userId, p_task_key: taskKey });
+      } catch (submitError) {
+        console.warn('trial_submit_task skipped:', submitError.message);
+      }
+
+      const review = await rpc('trial_review_task', {
+        p_telegram_id: userId,
+        p_task_key: taskKey,
+        p_decision: 'approve',
+        p_reward: TASK_REWARD
+      });
+
+      return res.json({
+        success: true,
+        result: review,
+        message: 'Task verified. Reward added!'
       });
     }
 
